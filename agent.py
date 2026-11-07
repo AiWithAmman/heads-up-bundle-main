@@ -48,6 +48,70 @@ AGENT_NAME = "hack ag"
 
 # ===== YOUR CODE HERE =====
 
+# ----- HANDOFF NOTES (work in progress, 2026-11-07) ---------------------------
+# WHY: a full 1000-deal judge match vs baseline_random (original code) won
+# +4.29 bb/deal, but our bot emptied its 8 s time bank in BOTH halves
+# (342 / 636 calls auto-checked/folded). Our own thinking alone was 6-9 s per
+# half, plus the judge charges HTTP time per request (only the first 1 ms is
+# free). On this Windows laptop that overhead was ~3 ms per call: even the
+# random bot was charged 6.7 s. So the work below is mostly about speed.
+#
+# DONE (code in this file):
+#   1. Preflop is a table lookup: preflop_table.npz (1.3 MB, must be
+#      committed), built by tools/build_preflop_table.py (~18 min on 2 cores).
+#      19,998 suit-canonical hands x 32 opponent-strength buckets, from
+#      900 boards x 1350 hands. Checked: matches the old live sampling (mean
+#      equity diff -0.003). If the file is missing, the old live sampling runs.
+#      REBUILD the table if you change _strength / equity / PREFLOP_BUCKETS.
+#   2. _strength vectorized (one sort instead of a loop). Checked: identical
+#      results to the old loop.
+#   3. Postflop opponent hands come from a fixed random pool (_OPP_POOL) and
+#      runouts from _runout_pairs, instead of argpartition every decision.
+#   4. SAMPLES cut from flop (16,250)/turn (14,300)/river (1,800) to
+#      (10,160)/(10,180)/(1,500).
+#   5. Pacing (_time_scale) also counts CALL_OVERHEAD per request (an estimate
+#      of judge-charged HTTP time). Scale 0.0 = on turn/river, reuse the
+#      earlier street's analysis instead of simulating (emergency path).
+#   6. Showdown learning (_learn_from_showdown): after each showdown, measure
+#      how strong the opponent's revealed hand really was on each street where
+#      their actions narrowed the range, and fit a per-opponent bluff_mix by
+#      maximum likelihood over BLUFF_GRID (shrunk toward BLUFF_MIX by
+#      SHOWDOWN_PRIOR). Checked in a 250-hand test: maniac -> 0.54, calling
+#      station -> 0.54 (wide calling range), nit -> stays 0.07.
+#      on_hand_end now also records that the opponent CALLED our last raise
+#      when the hand reached showdown (HandResult has no action list).
+#   7. tuned_params.json loader (_apply_tuned_params, bottom of this section)
+#      + tools/self_improve.py: offline hill-climbing of the TUNABLE knobs with
+#      paired arena matches. Learning cannot carry across tournament matches
+#      (fresh process + wiped memory every half), so it has to happen offline
+#      and be committed.
+#
+# NOT YET VERIFIED (do these next, in this order):
+#   a. python -m pytest -q  (passed BEFORE these changes; not re-run since).
+#   b. Time budget: last arena run (before change 5's reuse path) still used
+#      2.6-6.7 s thinking per half (worst: vs trapper). Re-check with
+#        python tools/arena.py --deals 1000
+#      (use --deals 1000: with fewer deals the pacing targets a shorter half
+#      and s/1000 looks inflated). Laptop timings swing 2-3x, so repeat runs.
+#   c. Strength vs the ORIGINAL bot: git show ffe27c2:agent.py > old_agent.py,
+#        python tools/arena.py --deals 1000 --only other_file --against old_agent.py
+#      (--only must include other_file or the head-to-head is skipped).
+#   d. Real judge, full match, every baseline, several seeds. On Windows use
+#      127.0.0.1, not localhost (the judge could not connect via localhost):
+#        python judge_engine.py --agent1 http://127.0.0.1:5008 --agent2 http://127.0.0.1:5009
+#      Goal: 0 errors and no "TIME BANK EMPTY".
+#   e. tools/self_improve.py has never been run. Try --rounds 2 --dry-run first.
+#   f. tools/check_build.sh (needs Docker + bash) before submitting.
+#
+# OPEN QUESTIONS / IDEAS:
+#   - CALL_OVERHEAD = 1.5 ms is a guess for the tournament's Linux box; the
+#     original author saw ~1 ms/call locally. Too low -> bank runs out; too high
+#     -> needlessly weak samples.
+#   - Showdown learning only covers flop/turn/river (preflop skipped), and is
+#     biased: we never see hands the opponent folded later.
+#   - Finer opponent stats (per street / position, check-raises) not started.
+# -----------------------------------------------------------------------------
+
 #
 # Strategy in one paragraph: every decision compares the expected value of
 # folding, calling and raising. Equity is measured against a RANGE: we sample
@@ -83,11 +147,16 @@ REALIZE = {
     Street.RIVER: (1.00, 1.00),
 }
 # Sample sizes per street: (runouts, opponent hands).
-SAMPLES = {Street.FLOP: (16, 250), Street.TURN: (14, 300), Street.RIVER: (1, 800)}
-# Our clock only sees choose_action. The judge also charges HTTP and JSON time,
-# which added up to 2 s per half locally, so these stay well below the 8 s bank.
-TIME_TARGET = 3.5     # seconds per half we aim to stay under
-TIME_PANIC = 5.0      # beyond this, spend almost nothing per decision
+SAMPLES = {Street.FLOP: (10, 160), Street.TURN: (10, 180), Street.RIVER: (1, 500)}
+# Preflop is a table lookup (tools/build_preflop_table.py writes the file).
+PREFLOP_TABLE_FILE = "preflop_table.npz"
+PREFLOP_BUCKETS = 32
+# Our clock only sees choose_action, but the judge charges each request's whole
+# round trip minus 1 ms. CALL_OVERHEAD is our estimate of the HTTP and JSON time
+# it charges per request beyond that, so the pacing below budgets for it too.
+CALL_OVERHEAD = 0.0015
+TIME_TARGET = 5.0     # charged seconds per half we aim to stay under (bank: 8)
+TIME_PANIC = 6.3      # beyond this, spend almost nothing per decision
 
 
 def _build_score_table():
@@ -135,14 +204,76 @@ def _sample_cards(deck: np.ndarray, rows: int, count: int) -> np.ndarray:
 
 def _strength(scores: np.ndarray, valid: np.ndarray, counts: np.ndarray) -> np.ndarray:
     """Average percentile of each opponent hand across the runouts (0..1)."""
-    masked = np.where(valid, scores, -1)
-    ordered = np.sort(masked, axis=1)
-    total = np.zeros(scores.shape[1])
-    invalid = (~valid).sum(axis=1)
-    for k in range(scores.shape[0]):
-        ranks = np.searchsorted(ordered[k], masked[k]) - invalid[k]
-        total += np.where(valid[k], ranks, 0) / max(scores.shape[1] - invalid[k], 1)
-    return total / np.maximum(counts, 1)
+    rows, cols = scores.shape
+    # Shift each runout's scores into its own range (scores < 2**24), so one
+    # searchsorted over the flattened, sorted rows ranks every runout at once.
+    offset = (np.arange(rows, dtype=np.int64) << 25)[:, None]
+    masked = np.where(valid, scores, -1).astype(np.int64) + offset
+    ordered = np.sort(masked, axis=1).ravel()
+    invalid = cols - valid.sum(axis=1)
+    ranks = np.searchsorted(ordered, masked.ravel()).reshape(rows, cols)
+    ranks -= np.arange(rows)[:, None] * cols + invalid[:, None]
+    share = np.where(valid, ranks, 0) / np.maximum(cols - invalid, 1)[:, None]
+    return share.sum(axis=0) / np.maximum(counts, 1)
+
+
+# Opponent hands for postflop sampling: a fixed pool of random hands, filtered
+# by the cards we can see. Far cheaper than drawing fresh hands every decision.
+_OPP_POOL = _sample_cards(np.arange(N_CARDS), 20000, 5)
+_OPP_POOL_MASKS = _BIT[_OPP_POOL].sum(axis=1)
+_PAIRS_OF: dict[int, np.ndarray] = {}   # deck size -> every pair of positions
+
+
+def _opponent_hands(known_mask: np.int64, count: int) -> np.ndarray:
+    """count random opponent hands that avoid the known cards."""
+    fits = np.flatnonzero((_OPP_POOL_MASKS & known_mask) == 0)
+    start = int(_RNG.integers(fits.size))
+    return _OPP_POOL[fits[(start + np.arange(min(count, fits.size))) % fits.size]]
+
+
+def _runout_pairs(deck: np.ndarray, count: int) -> np.ndarray:
+    """count distinct 2-card runouts from deck."""
+    pairs = _PAIRS_OF.get(deck.size)
+    if pairs is None:
+        pairs = _PAIRS_OF[deck.size] = np.array(list(combinations(range(deck.size), 2)))
+    picked = _RNG.choice(len(pairs), size=min(count, len(pairs)), replace=False)
+    return deck[pairs[picked]]
+
+
+# ----- Preflop table -----------------------------------------------------------
+# Renaming suits never changes a hand's equity, so a hand is stored under its
+# canonical key: the smallest encoding over all 24 suit renamings.
+
+_SUIT_PERMS = np.array(list(permutations(range(4))), dtype=np.int64)  # (24, 4)
+_KEY_WEIGHTS = N_CARDS ** np.arange(4, -1, -1, dtype=np.int64)        # base-36 digits
+
+
+def _canonical_keys(hands: np.ndarray) -> np.ndarray:
+    """(..., 5) hands -> (...) canonical keys."""
+    ranks, suits = hands >> 2, hands & 3
+    renamed = np.sort(ranks[..., None, :] * 4 + _SUIT_PERMS[:, suits].swapaxes(0, -2), axis=-1)
+    return (renamed @ _KEY_WEIGHTS).min(axis=-1)
+
+
+def _all_canonical_hands() -> tuple[np.ndarray, np.ndarray]:
+    """Sorted canonical keys, and the hand each key stands for."""
+    hands = np.array(list(combinations(range(N_CARDS), 5)), dtype=np.int64)
+    keys = np.unique(np.concatenate([_canonical_keys(chunk) for chunk in np.array_split(hands, 20)]))
+    reps = (keys[:, None] // _KEY_WEIGHTS) % N_CARDS
+    return keys, reps
+
+
+def _load_preflop_table():
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), PREFLOP_TABLE_FILE)
+        with np.load(path) as data:
+            table = {"keys": data["keys"], "equity": data["equity"].astype(np.float64) / 65535,
+                     "strength": data["strength"].astype(np.float64)}
+        if table["equity"].shape != (table["keys"].size, PREFLOP_BUCKETS):
+            return None
+        return table
+    except Exception:
+        return None  # fall back to live preflop sampling
 
 
 def _build_preflop_pool(n_boards: int = 300, n_hands: int = 600) -> dict:
@@ -165,11 +296,25 @@ def _build_preflop_pool(n_boards: int = 300, n_hands: int = 600) -> dict:
     }
 
 
-_POOL = _build_preflop_pool()
+_PREFLOP = _load_preflop_table()
+# Live sampling is only the fallback for a missing or broken table file.
+_POOL = _build_preflop_pool() if _PREFLOP is None else None
 
 
 def _preflop_analysis(hole: np.ndarray, scale: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
-    """Per-opponent-hand equity and strength for our hole cards."""
+    """Equity and strength per opponent-strength bucket (or per sampled hand)."""
+    if _PREFLOP is not None:
+        key = _canonical_keys(hole)
+        row = int(np.searchsorted(_PREFLOP["keys"], key))
+        if row < _PREFLOP["keys"].size and _PREFLOP["keys"][row] == key:
+            return _PREFLOP["equity"][row], _PREFLOP["strength"]
+    return _sampled_preflop_analysis(hole, scale)
+
+
+def _sampled_preflop_analysis(hole: np.ndarray, scale: float) -> tuple[np.ndarray, np.ndarray]:
+    global _POOL
+    if _POOL is None:
+        _POOL = _build_preflop_pool()
     my_mask = _BIT[hole].sum()
     boards_ok = (_POOL["board_masks"] & my_mask) == 0
     hands_ok = (_POOL["hand_masks"] & my_mask) == 0
@@ -199,10 +344,10 @@ def _postflop_analysis(hole: np.ndarray, board: np.ndarray, street: Street,
         boards = np.empty((runouts, 5), dtype=np.int64)
         boards[:, :board.size] = board
         if missing == 1:
-            boards[:, 4] = _RNG.permutation(deck)[:runouts]
+            boards[:, 4] = _RNG.choice(deck, size=runouts, replace=False)
         else:
-            boards[:, board.size:] = _sample_cards(deck, runouts, missing)
-    hands = _sample_cards(deck, n_hands, 5)
+            boards[:, board.size:] = _runout_pairs(deck, runouts)
+    hands = _opponent_hands(_BIT[hole].sum() + _BIT[board].sum(), n_hands)
     pair_scores = _pair_scores(boards)
     opp = pair_scores[:, _pair_ids(hands)].max(axis=2)
     mine = pair_scores[:, _pair_ids(hole)].max(axis=1)[:, None]
@@ -239,12 +384,13 @@ def _new_hand_state(obs: Observation) -> dict:
     return {
         "index": obs.hand_index,
         "button": obs.is_button,
-        "seen": 0,                     # entries of action_history already replayed
+        "hole": tuple(obs.hole_cards),
+        "seen": 0,                    # entries of action_history already replayed
         "street": Street.PREFLOP,
         "my_total": my_blind,
         "opp_total": opp_blind,
         "keep": [1.0, 1.0, 1.0, 1.0],  # share of hands surviving each street's actions
-        "my_last": None,               # (kind, size, group) of our latest unanswered action
+        "my_last": None,               # (kind, size, group, street) of our latest unanswered action
         "analysis": {},                # street -> (equity, strength)
     }
 
@@ -287,24 +433,95 @@ def _range_keep(hand: dict, street: Street) -> float:
     return keep
 
 
-def _range_weights(strength: np.ndarray, keep: float) -> np.ndarray:
+def _range_weights(strength: np.ndarray, keep: float, bluff_mix: float = None) -> np.ndarray:
+    """How likely each hand is in the opponent's range: a soft cut that keeps
+    the strongest `keep` share, plus a floor of bluff_mix for everything."""
+    if bluff_mix is None:
+        bluff_mix = BLUFF_MIX
     cut = 1.1 * (1.0 - keep) - 0.1
     x = np.clip((strength - cut) / RANGE_SOFTNESS, -30.0, 30.0)
-    return BLUFF_MIX + (1.0 - BLUFF_MIX) / (1.0 + np.exp(-x))
+    return bluff_mix + (1.0 - bluff_mix) / (1.0 + np.exp(-x))
+
+
+# ----- Learning from showdowns ------------------------------------------------
+# At a showdown we see the opponent's cards, so we can check our range model:
+# on every street where their actions narrowed the range, was the hand they
+# really held strong (top half) or weak (bottom half)? The model predicts the
+# weak share from bluff_mix. We keep the log-likelihood of every bluff_mix on a
+# grid and play the best fit, pulled toward the default while data is scarce.
+
+BLUFF_GRID = np.linspace(0.01, 0.60, 60)
+SHOWDOWN_PRIOR = 15.0      # pseudo-showdowns behind the default BLUFF_MIX
+SHOWDOWN_SAMPLES = (6, 150)  # (runouts, comparison hands) per street checked
+
+
+def _showdown_strength(opp: np.ndarray, board: np.ndarray, hole: np.ndarray,
+                       runouts: int, n_hands: int) -> tuple[float, np.ndarray]:
+    """The opponent's real hand strength on this board, and the strengths of
+    comparison hands sampled the same way as in a live decision."""
+    comps = _opponent_hands(_BIT[hole].sum() + _BIT[board].sum(), n_hands)
+    missing = 5 - board.size
+    if missing == 0:
+        boards = board[None, :]
+    else:
+        used = np.zeros(N_CARDS, dtype=bool)
+        used[hole] = used[board] = used[opp] = True
+        deck = np.flatnonzero(~used)
+        runouts = min(runouts, deck.size)
+        boards = np.empty((runouts, 5), dtype=np.int64)
+        boards[:, :board.size] = board
+        if missing == 1:
+            boards[:, 4] = _RNG.choice(deck, size=runouts, replace=False)
+        else:
+            boards[:, board.size:] = _runout_pairs(deck, runouts)
+    pair_scores = _pair_scores(boards)
+    comp_scores = pair_scores[:, _pair_ids(comps)].max(axis=2)
+    runout_masks = _BIT[boards[:, board.size:]].sum(axis=1)
+    valid = (runout_masks[:, None] & _BIT[comps].sum(axis=1)[None, :]) == 0
+    counts = valid.sum(axis=0)
+    opp_scores = pair_scores[:, _pair_ids(opp)].max(axis=1)[:, None]
+    beaten = ((comp_scores < opp_scores) & valid).sum(axis=1) / np.maximum(valid.sum(axis=1), 1)
+    return float(beaten.mean()), _strength(comp_scores, valid, counts)
+
+
+def _learn_from_showdown(result: HandResult, hand: dict, memory: dict) -> None:
+    opp = np.array(result.opp_hole, dtype=np.int64)
+    hole = np.array(hand["hole"], dtype=np.int64)
+    full_board = np.array(result.board, dtype=np.int64)
+    runouts, n_hands = SHOWDOWN_SAMPLES
+    for street in (Street.FLOP, Street.TURN, Street.RIVER):
+        if hand["keep"][int(street)] >= 1.0 or full_board.size < int(street) + 2:
+            continue  # the opponent's actions said nothing new on this street
+        board = full_board[:int(street) + 2]
+        theirs, comps = _showdown_strength(opp, board, hole, runouts, n_hands)
+        weak_side = comps < np.median(comps)
+        weak = theirs < np.median(comps)
+        sig = _range_weights(comps, _range_keep(hand, street), 0.0)
+        weights = BLUFF_GRID[:, None] + (1.0 - BLUFF_GRID[:, None]) * sig[None, :]
+        p_weak = np.clip((weights * weak_side).sum(axis=1) / weights.sum(axis=1), 1e-4, 1 - 1e-4)
+        memory["bluff_ll"] += np.log(p_weak if weak else 1.0 - p_weak)
+        memory["bluff_n"] += 1
+    n = memory["bluff_n"]
+    if n:
+        best = float(BLUFF_GRID[int(np.argmax(memory["bluff_ll"]))])
+        memory["bluff_mix"] = (n * best + SHOWDOWN_PRIOR * BLUFF_MIX) / (n + SHOWDOWN_PRIOR)
 
 
 # ----- Decisions -------------------------------------------------------------
 
 def _time_scale(obs: Observation, memory: dict) -> float:
-    """Shrink the samples if this half is on pace to overspend its time."""
-    used = memory["time_used"]
+    """Shrink the samples if this half is on pace to overspend its time.
+    0.0 means: don't simulate at all if an earlier street's analysis exists."""
+    used = memory["time_used"] + memory.get("calls", 0) * CALL_OVERHEAD
     if used > TIME_PANIC:
-        return 0.1
+        return 0.0
     projected = used / max(obs.hand_index, 20) * memory["num_hands"]
     if projected > TIME_TARGET * 1.3:
-        return 0.3
+        return 0.0
+    if projected > TIME_TARGET * 1.15:
+        return 0.25
     if projected > TIME_TARGET:
-        return 0.6
+        return 0.5
     return 1.0
 
 
@@ -313,17 +530,21 @@ def _analysis(obs: Observation, memory: dict) -> tuple[np.ndarray, np.ndarray]:
     if obs.street not in cache:
         hole = np.array(obs.hole_cards, dtype=np.int64)
         scale = _time_scale(obs, memory)
+        earlier = [street for street in cache if Street.PREFLOP < street < obs.street]
         if obs.street == Street.PREFLOP:
-            cache[obs.street] = _preflop_analysis(hole, scale)
+            cache[obs.street] = _preflop_analysis(hole, max(scale, 0.3))
+        elif scale == 0.0 and earlier:
+            cache[obs.street] = cache[max(earlier)]  # out of time: reuse, slightly stale
         else:
             board = np.array(obs.board, dtype=np.int64)
-            cache[obs.street] = _postflop_analysis(hole, board, obs.street, scale)
+            cache[obs.street] = _postflop_analysis(hole, board, obs.street, max(scale, 0.1))
     return cache[obs.street]
 
 
 def _best_action(obs: Observation, memory: dict) -> Action:
     equity, strength = _analysis(obs, memory)
-    weights = _range_weights(strength, _range_keep(memory["hand"], obs.street))
+    weights = _range_weights(strength, _range_keep(memory["hand"], obs.street),
+                             memory.get("bluff_mix", BLUFF_MIX))
 
     # tail_*[i] sums over hand i and everything stronger: raises need the
     # equity against just the part of the range that continues.
@@ -373,13 +594,18 @@ def _safe_action(obs: Observation) -> Action:
 def new_half(config: AgentConfig, memory: dict) -> None:
     """Called at the start of each half-match (1000 hands)."""
     memory["num_hands"] = config.num_hands
-    memory["time_used"] = 0.0
+    memory["time_used"] = 0.0   # seconds spent inside choose_action
+    memory["calls"] = 0         # requests answered (each also costs CALL_OVERHEAD)
     memory["hand"] = None
     # facing[group][size] = [folds, calls, raises] when facing OUR raise.
     # group: 0 preflop, 1 postflop. size: 0 smaller, 1 about pot or more.
     memory["facing"] = [[[0, 0, 0], [0, 0, 0]], [[0, 0, 0], [0, 0, 0]]]
     # open[group] = [raises, chances] when the opponent wasn't facing a raise.
     memory["open"] = [[0, 0], [0, 0]]
+    # Showdown learning: log-likelihood of each BLUFF_GRID value, streets checked.
+    memory["bluff_ll"] = np.zeros(BLUFF_GRID.size)
+    memory["bluff_n"] = 0
+    memory["bluff_mix"] = BLUFF_MIX
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
@@ -399,6 +625,7 @@ def choose_action(obs: Observation, memory: dict) -> Action:
         # Note this now: if the opponent folds, no later decision will see it.
         _note_my_action(obs, action, memory["hand"])
     memory["time_used"] += time.perf_counter() - started
+    memory["calls"] = memory.get("calls", 0) + 1
     return action
 
 
@@ -406,26 +633,67 @@ def _note_my_action(obs: Observation, action: Action, hand: dict) -> None:
     group = min(int(obs.street), 1)
     if action in RAISE_ACTIONS:
         size = int(obs.raise_to[action] - obs.opp_bet >= 0.75 * (obs.pot + obs.to_call))
-        hand["my_last"] = ("raise", size, group)
+        hand["my_last"] = ("raise", size, group, obs.street)
     else:
-        hand["my_last"] = ("check" if obs.to_call == 0 else "call", 0, group)
+        hand["my_last"] = ("check" if obs.to_call == 0 else "call", 0, group, obs.street)
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
-    """Called once for every finished hand: settle what the opponent did last."""
+    """Called once for every finished hand: settle what the opponent did last,
+    and learn from their cards if there was a showdown."""
+    started = time.perf_counter()
     try:
         hand = memory["hand"]
         if hand is None or hand["index"] != result.hand_index:
             # We never acted, so the opponent folded their small blind.
             memory["open"][0][1] += 1
-        elif hand["my_last"] is not None:
-            kind, size, group = hand["my_last"]
+            return
+        if hand["my_last"] is not None:
+            kind, size, group, street = hand["my_last"]
             if kind == "raise":
                 memory["facing"][group][size][1 if result.went_to_showdown else 0] += 1
+                if result.went_to_showdown:  # they called our last raise
+                    hand["keep"][int(street)] *= max(1.0 - _fold_rate(memory, group, size), 0.05)
             elif kind == "check" and result.went_to_showdown and not hand["button"]:
                 memory["open"][1][1] += 1  # we checked the river and they checked back
+        # Learning is worth less than deciding well: skip it when time is tight.
+        spent = memory.get("time_used", 0.0) + memory.get("calls", 0) * CALL_OVERHEAD
+        projected = spent / max(result.hand_index, 20) * memory.get("num_hands", 1000)
+        if result.went_to_showdown and result.opp_hole and projected < TIME_TARGET:
+            _learn_from_showdown(result, hand, memory)
     except Exception:
         pass  # a crash here would count as an error; one lost stat doesn't matter
+    finally:
+        if "time_used" in memory:
+            memory["time_used"] += time.perf_counter() - started
+
+
+# ----- Tuned settings ----------------------------------------------------------
+# tools/self_improve.py plays matches offline and writes the knob values that
+# won to tuned_params.json. Only these names are read, and any problem with the
+# file just leaves the defaults above in place.
+TUNED_PARAMS_FILE = "tuned_params.json"
+TUNABLE = ("BLUFF_MIX", "RANGE_SOFTNESS", "PRIOR_STREET_DECAY", "RERAISE_PENALTY",
+           "BET_MARGIN", "PRIOR_WEIGHT", "SHOWDOWN_PRIOR")
+
+
+def _apply_tuned_params() -> None:
+    try:
+        import json
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), TUNED_PARAMS_FILE)
+        if not os.path.exists(path):
+            return
+        with open(path, encoding="utf-8") as handle:
+            tuned = json.load(handle)
+        for name in TUNABLE:
+            value = tuned.get(name)
+            if isinstance(value, (int, float)) and np.isfinite(value) and value >= 0:
+                globals()[name] = float(value)
+    except Exception:
+        pass
+
+
+_apply_tuned_params()
 
 # ===== END OF YOUR CODE =====
 
