@@ -84,10 +84,12 @@ REALIZE = {
 }
 # Sample sizes per street: (runouts, opponent hands).
 SAMPLES = {Street.FLOP: (16, 250), Street.TURN: (14, 300), Street.RIVER: (1, 800)}
-# Our clock only sees choose_action. The judge also charges HTTP and JSON time,
-# which added up to 2 s per half locally, so these stay well below the 8 s bank.
-TIME_TARGET = 3.5     # seconds per half we aim to stay under
-TIME_PANIC = 5.0      # beyond this, spend almost nothing per decision
+# Our clock only sees choose_action, but the judge charges the whole request.
+# A do-nothing bot in a 1-CPU container was charged about 1 ms per call, which
+# is up to 4-5 s of the 8 s bank, so pacing adds this much to every call.
+CALL_OVERHEAD = 0.0012
+TIME_TARGET = 5.5     # estimated seconds charged per half we aim to stay under
+TIME_PANIC = 6.8      # beyond this, spend almost nothing per decision
 
 
 def _build_score_table():
@@ -297,7 +299,7 @@ def _range_weights(strength: np.ndarray, keep: float) -> np.ndarray:
 
 def _time_scale(obs: Observation, memory: dict) -> float:
     """Shrink the samples if this half is on pace to overspend its time."""
-    used = memory["time_used"]
+    used = memory["time_used"] + memory["calls"] * CALL_OVERHEAD
     if used > TIME_PANIC:
         return 0.1
     projected = used / max(obs.hand_index, 20) * memory["num_hands"]
@@ -374,6 +376,7 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     """Called at the start of each half-match (1000 hands)."""
     memory["num_hands"] = config.num_hands
     memory["time_used"] = 0.0
+    memory["calls"] = 0
     memory["hand"] = None
     # facing[group][size] = [folds, calls, raises] when facing OUR raise.
     # group: 0 preflop, 1 postflop. size: 0 smaller, 1 about pot or more.
@@ -386,6 +389,7 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     """Called every time it is your turn. Return one of obs.legal_actions."""
     started = time.perf_counter()
     try:
+        memory["calls"] += 1
         if memory["hand"] is None or memory["hand"]["index"] != obs.hand_index:
             memory["hand"] = _new_hand_state(obs)
         _replay(obs, memory)
