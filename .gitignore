@@ -1,3 +1,25 @@
+# Python
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
+venv/
+
+# Secrets (AGENT_TOKEN and the like)
+.env
+.env.*
+*.pem
+*.key
+
+# Match output: python judge_engine.py --json out.json --logs
+out.json
+h1.json
+h2.json
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+.claude/
+Thumbs.db
+.DS_Store
