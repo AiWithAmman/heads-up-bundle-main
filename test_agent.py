@@ -320,3 +320,26 @@ def test_time_pacing_shrinks_samples_when_behind():
     assert module._time_scale(obs, memory) == 1.0
     memory["time_used"] = module.TIME_PANIC + 0.1
     assert module._time_scale(obs, memory) < 0.2
+
+
+def test_equity_stays_honest_when_sampling_is_cut_for_time():
+    # With very few runouts, hands that clash with all of them used to count as
+    # 0% equity, so the bot underrated itself by up to 10% when short of time.
+    module = load_agent()
+    np = module.np
+    rng = random.Random(3)
+    for street, seen in ((1, 3), (2, 4)):
+        gaps = []
+        for _ in range(40):
+            cards = rng.sample(range(36), 5 + seen)
+            hole, board = np.array(cards[:5]), np.array(cards[5:])
+            full = np.mean([module._postflop_analysis(hole, board, street_of(module, street), 1.0)[0].mean()
+                            for _ in range(6)])
+            cut = np.mean([module._postflop_analysis(hole, board, street_of(module, street), 0.1)[0].mean()
+                           for _ in range(30)])
+            gaps.append(cut - full)
+        assert abs(np.mean(gaps)) < 0.02, f"street {street}: reduced sampling is biased by {np.mean(gaps):+.3f}"
+
+
+def street_of(module, number):
+    return module.Street(number)

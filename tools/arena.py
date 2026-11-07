@@ -3,13 +3,16 @@ tools/arena.py - fast in-process duplicate matches, no web server or judge.
 
     python tools/arena.py                     # agent.py vs every sparring bot
     python tools/arena.py --deals 400 --seeds 2 --only mc_tight,maniac
-    python tools/arena.py --set BLUFF_MIX=0.2,RANGE_SOFTNESS=0.1
+    python tools/arena.py --set "BLUFF_MIX=0.2;PRIOR_FOLD=(0.3, 0.4)"
+    python tools/arena.py --against old_agent.py,other_agent.py
 
-Scores the same way as the judge (bb per deal over paired halves, 95% CI).
+Scores the same way as the judge (bb per deal: the two hands of a deal added
+together, with a 95% CI).
 It skips HTTP, so its timing is thinking time only. Use judge_engine.py for
 the real thing before submitting.
 """
 import argparse
+import ast
 import importlib.util
 import math
 import os
@@ -160,6 +163,27 @@ class Trapper(Bot):
         return Action.CHECK_CALL if obs.to_call == 0 or equity >= price + 0.08 else Action.FOLD
 
 
+class Bluffer(MonteCarlo):
+    """A decent bot that also bluffs a lot: it bets its weakest hands when checked to."""
+
+    def act(self, obs):
+        action = super().act(obs)
+        if (obs.to_call == 0 and action == Action.CHECK_CALL and obs.street != Street.PREFLOP
+                and Action.RAISE_POT in obs.legal_actions and self.rng.random() < 0.45):
+            return Action.RAISE_POT
+        return action
+
+
+def clone(**changes):
+    """A separate copy of agent.py with some constants changed."""
+    def build():
+        module = load("agent.py", f"arena_clone_{len(changes)}_{id(changes)}")
+        for name, value in changes.items():
+            setattr(module, name, value)
+        return Module(module)
+    return build
+
+
 def opponents():
     return {
         "random": Random(),
@@ -173,6 +197,9 @@ def opponents():
         "mc_aggro": MonteCarlo(0.52, 0.62),
         "bully": Bully(),
         "trapper": Trapper(),
+        "bluffer": Bluffer(0.62, 0.72),
+        "clone_aggro": clone(BET_MARGIN=-2.0),
+        "clone_passive": clone(BET_MARGIN=3.0),
     }
 
 
@@ -199,30 +226,33 @@ def match(hero, villain, seed, deals):
     first_used = hero.memory["time_used"]
     second = [-n for n in play_half((villain, hero), seed, deals, config)]
     used = max(first_used, hero.memory["time_used"]) * 1000 / deals
-    return [(a + b) / 2 / BIG_BLIND for a, b in zip(first, second)], used
+    return [(a + b) / BIG_BLIND for a, b in zip(first, second)], used
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--deals", type=int, default=300)
     parser.add_argument("--seeds", type=int, default=1)
+    parser.add_argument("--first-seed", type=int, default=0, help="start here for unseen cards")
     parser.add_argument("--only", default="", help="comma-separated opponent names")
-    parser.add_argument("--set", default="", help="override float constants in agent.py")
-    parser.add_argument("--against", default="", help="also play another agent file, e.g. an old copy")
+    parser.add_argument("--set", default="", help="override agent.py constants, separated by ;")
+    parser.add_argument("--against", default="", help="comma-separated agent files to play too")
     args = parser.parse_args()
-    for item in filter(None, args.set.split(",")):
+    for item in filter(None, args.set.split(";")):
         name, value = item.split("=")
-        setattr(AGENT, name, float(value))
+        setattr(AGENT, name, ast.literal_eval(value))
     pool = opponents()
-    if args.against:
-        pool["other_file"] = Module(load(os.path.abspath(args.against), "arena_other"))
+    for number, path in enumerate(filter(None, args.against.split(","))):
+        name = os.path.splitext(os.path.basename(path))[0]
+        pool[name] = Module(load(os.path.abspath(path), f"arena_other_{number}"))
     names = args.only.split(",") if args.only else list(pool)
     means = []
     print(f"{'opponent':<14}{'bb/deal':>9}{'+-95%':>8}  verdict {'s/1000':>8}")
     for name in names:
         results, worst = [], 0.0
-        for s in range(args.seeds):
-            per_deal, used = match(Module(AGENT), pool[name], f"arena{s}", args.deals)
+        for s in range(args.first_seed, args.first_seed + args.seeds):
+            villain = pool[name]() if callable(pool[name]) else pool[name]
+            per_deal, used = match(Module(AGENT), villain, f"arena{s}", args.deals)
             results += per_deal
             worst = max(worst, used)
         mean = sum(results) / len(results)

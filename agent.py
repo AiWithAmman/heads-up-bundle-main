@@ -212,7 +212,10 @@ def _postflop_analysis(hole: np.ndarray, board: np.ndarray, street: Street,
     valid = (runout_masks[:, None] & _BIT[hands].sum(axis=1)[None, :]) == 0
     counts = valid.sum(axis=0)
     points = ((mine > opp) + 0.5 * (mine == opp)) * valid
-    return points.sum(axis=0) / np.maximum(counts, 1), _strength(opp, valid, counts)
+    # With few runouts a hand can clash with all of them, so it has no result.
+    # Counting it as 0% equity would make us underrate our hand when short of time.
+    seen = counts > 0
+    return (points.sum(axis=0) / np.maximum(counts, 1))[seen], _strength(opp, valid, counts)[seen]
 
 
 # ----- Opponent model --------------------------------------------------------
