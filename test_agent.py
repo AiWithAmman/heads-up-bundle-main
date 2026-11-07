@@ -195,3 +195,128 @@ def test_reads_port_from_environment():
 # ---------------------------------------------------------------------------
 # Add your own tests below, e.g. "with two aces preflop my bot raises".
 # ---------------------------------------------------------------------------
+
+def observation_for(deal, button, actions=()):
+    """The observation the player to act gets after `actions`."""
+    game = Game(deal, button)
+    for action in actions:
+        game.apply(action)
+    return game.observation(game.to_act), game
+
+
+def test_score_table_matches_the_official_evaluator():
+    # Every decision relies on this table, so it must agree with omaha_score.
+    from evaluator import omaha_score
+    module = load_agent()
+    rng = random.Random(5)
+    np = module.np
+    for _ in range(3000):
+        cards = rng.sample(range(36), 10)
+        hole, board = cards[:5], cards[5:]
+        pair_scores = module._pair_scores(np.array([board]))
+        fast = pair_scores[:, module._pair_ids(np.array(hole))].max()
+        assert fast == omaha_score(hole, board)
+
+
+def test_opponent_folds_to_our_raise_are_learned():
+    # A fold ends the hand, so no later decision can see it: on_hand_end has to.
+    module = load_agent()
+    memory = {}
+    module.new_half(AgentConfig(), memory)
+    obs, game = observation_for(make_deal("fold", 0), 0)
+    module._best_action = lambda o, m: Action.RAISE_POT
+    module.choose_action(obs, memory)
+    game.apply(Action.RAISE_POT)
+    game.apply(Action.FOLD)
+    module.on_hand_end(game.hand_result(0), memory)
+    assert sum(memory["facing"][0][1]) == 1 and memory["facing"][0][1][0] == 1
+
+
+def test_calls_after_our_raise_are_learned_at_showdown():
+    module = load_agent()
+    memory = {}
+    module.new_half(AgentConfig(), memory)
+    obs, game = observation_for(make_deal("call", 0), 0)
+    module._best_action = lambda o, m: Action.RAISE_POT
+    while not game.is_terminal:  # we shove every street, the opponent calls
+        if game.to_act == 0:
+            obs = game.observation(0)
+            action = module.choose_action(obs, memory)
+            game.apply(action)
+        else:
+            game.apply(Action.CHECK_CALL)
+    module.on_hand_end(game.hand_result(0), memory)
+    assert memory["facing"][1][1][0] == 0, "a called raise must not count as a fold"
+    assert memory["facing"][1][1][1] >= 1 or memory["facing"][0][1][1] >= 1
+
+
+def test_crash_inside_the_strategy_still_gives_a_legal_action():
+    module = load_agent()
+    memory = {}
+    module.new_half(AgentConfig(), memory)
+
+    def broken(obs, memory):
+        raise RuntimeError("bug in the strategy")
+
+    module._best_action = broken
+    obs, game = observation_for(make_deal("crash", 0), 0)
+    assert module.choose_action(obs, memory) in obs.legal_actions
+    # And with a bet to face, too.
+    obs, game = observation_for(make_deal("crash", 0), 0, [Action.RAISE_POT])
+    assert module.choose_action(obs, memory) in obs.legal_actions
+
+
+def test_on_hand_end_survives_bad_memory():
+    module = load_agent()
+    memory = {}  # new_half never ran: every lookup would raise
+    result = Game(make_deal("x", 0), 0)
+    result.apply(Action.FOLD)
+    module.on_hand_end(result.hand_result(0), memory)
+
+
+def test_never_folds_when_checking_is_free():
+    module = load_agent()
+    memory = {}
+    module.new_half(AgentConfig(), memory)
+    for hand in range(100):
+        game = Game(make_deal("free", hand), hand % 2, hand_index=hand)
+        while not game.is_terminal:
+            obs = game.observation(game.to_act)
+            action = module.choose_action(obs, memory)
+            if obs.to_call == 0:
+                assert action != Action.FOLD
+            game.apply(action if game.to_act == 0 else Action.CHECK_CALL)
+
+
+def test_uses_a_nut_hand_on_the_river():
+    # Royal flush on the river: the bot must not fold or just give up the hand.
+    from evaluator import cards_from_str
+    from game import Deal
+    module = load_agent()
+    memory = {}
+    module.new_half(AgentConfig(), memory)
+    hole = tuple(sorted(cards_from_str("Ah Kh 6c 7d 8s")))
+    opp = tuple(sorted(cards_from_str("6d 7c 8d 9c Tc")))
+    deal = Deal((hole, opp), tuple(cards_from_str("Qh Jh Th 6s 7s")))
+    game = Game(deal, 0)
+    game.apply(Action.CHECK_CALL)
+    game.apply(Action.CHECK_CALL)
+    while game.street != 3:
+        game.apply(Action.CHECK_CALL)
+    obs = game.observation(game.to_act)
+    if game.to_act == 0:
+        assert module.choose_action(obs, memory) in (Action.RAISE_HALF, Action.RAISE_POT)
+    else:
+        game.apply(Action.RAISE_HALF)
+        obs = game.observation(0)
+        assert module.choose_action(obs, memory) in (Action.RAISE_HALF, Action.RAISE_POT)
+
+
+def test_time_pacing_shrinks_samples_when_behind():
+    module = load_agent()
+    memory = {}
+    module.new_half(AgentConfig(), memory)
+    obs, _ = observation_for(make_deal("t", 0), 0)
+    assert module._time_scale(obs, memory) == 1.0
+    memory["time_used"] = module.TIME_PANIC + 0.1
+    assert module._time_scale(obs, memory) < 0.2
