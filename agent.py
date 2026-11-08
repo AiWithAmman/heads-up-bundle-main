@@ -42,7 +42,7 @@ from game import RAISE_ACTIONS, Action, AgentConfig, HandResult, Observation, St
 warmup()
 
 # rename as your team/bot's name
-PARTICIPANT = "hack the hacker"
+PARTICIPANT = "hack the hackers"
 AGENT_NAME = "hack ag"
 
 
