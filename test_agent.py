@@ -343,3 +343,34 @@ def test_equity_stays_honest_when_sampling_is_cut_for_time():
 
 def street_of(module, number):
     return module.Street(number)
+
+
+def test_checks_cap_the_range_and_raises_clear_it():
+    # A check means the opponent's strongest hands would have bet, so they get
+    # less weight; a raise afterwards (a check-raise) must undo that.
+    module = load_agent()
+    np = module.np
+    strength = np.linspace(0.0, 1.0, 101)
+    hand = {"cap": [1.0, 1.0, 1.0, 1.0]}
+    uncapped = module._range_weights(strength, 1.0, module._range_cap(hand, street_of(module, 1)))
+    hand["cap"][1] = 0.6
+    capped = module._range_weights(strength, 1.0, module._range_cap(hand, street_of(module, 1)))
+    assert capped[-1] < 0.5 * uncapped[-1]          # monsters mostly gone
+    assert abs(capped[10] - uncapped[10]) < 0.01      # weak hands barely touched
+    hand["cap"][1] = 0.01
+    assert module._range_cap(hand, street_of(module, 1)) == module.CAP_FLOOR
+
+    # Seat 0 is the button: it limps, we (seat 1) see a capped range.
+    memory = {}
+    module.new_half(AgentConfig(), memory)
+    game = Game(make_deal("cap", 0), 0)
+    game.apply(Action.CHECK_CALL)
+    module.choose_action(game.observation(1), memory)
+    assert memory["hand"]["cap"][0] < 1.0
+    # We check the flop and the button bets: the bet clears every cap.
+    game.apply(Action.CHECK_CALL)
+    assert game.street == 1 and game.to_act == 1
+    game.apply(Action.CHECK_CALL)
+    game.apply(Action.RAISE_HALF)
+    module.choose_action(game.observation(1), memory)
+    assert memory["hand"]["cap"] == [1.0, 1.0, 1.0, 1.0]

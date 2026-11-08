@@ -75,6 +75,11 @@ PRIOR_WEIGHT = 5.0        # opponent stats: pseudo-observations behind each prio
 PRIOR_FOLD = (0.30, 0.35)     # (preflop, postflop) folds to a raise
 PRIOR_RAISE = (0.20, 0.15)    # (preflop, postflop) re-raises when facing a raise
 PRIOR_OPEN = (0.40, 0.35)     # (preflop, postflop) raises when not facing a raise
+# A check or a call (instead of a raise) caps the range: hands strong enough to
+# have raised are mostly gone. CAP_TRUST is how much of them we remove; any
+# raise by the opponent clears every cap, so check-raise traps don't fool us.
+CAP_TRUST = 1.0
+CAP_FLOOR = 0.5           # never cap the range below this share of hands
 # Share of raw equity we expect to realise: (in position, out of position).
 REALIZE = {
     Street.PREFLOP: (1.00, 0.92),
@@ -249,6 +254,7 @@ def _new_hand_state(obs: Observation) -> dict:
         "my_total": my_blind,
         "opp_total": opp_blind,
         "keep": [1.0, 1.0, 1.0, 1.0],  # share of hands surviving each street's actions
+        "cap": [1.0, 1.0, 1.0, 1.0],   # share below the top cut-off (hands that didn't raise)
         "my_last": None,               # (kind, size, group) of our latest unanswered action
         "analysis": {},                # street -> (equity, strength)
     }
@@ -274,11 +280,17 @@ def _replay(obs: Observation, memory: dict) -> None:
             size = hand["my_last"][1] if hand["my_last"] else 0
             memory["facing"][group][size][2 if raised else 1] += 1
             keep = _raise_rate(memory, group, size) if raised else 1.0 - _fold_rate(memory, group, size)
+            cap = 1.0 if raised else 1.0 - _raise_rate(memory, group, size)
         else:
             memory["open"][group][0] += raised
             memory["open"][group][1] += 1
             keep = _open_rate(memory, group) if raised else 1.0
+            cap = 1.0 if raised else 1.0 - _open_rate(memory, group)
         hand["keep"][int(act.street)] *= max(keep, 0.05)
+        if raised:
+            hand["cap"] = [1.0, 1.0, 1.0, 1.0]
+        else:
+            hand["cap"][int(act.street)] *= cap
         hand["opp_total"] = act.street_total
         hand["my_last"] = None
     hand["seen"] = len(obs.action_history)
@@ -292,10 +304,23 @@ def _range_keep(hand: dict, street: Street) -> float:
     return keep
 
 
-def _range_weights(strength: np.ndarray, keep: float) -> np.ndarray:
+def _range_cap(hand: dict, street: Street) -> float:
+    """The share of hands below the top cut-off (1.0 = the range isn't capped)."""
+    cap = hand["cap"][int(street)]
+    for earlier in range(int(street)):
+        cap *= hand["cap"][earlier] ** PRIOR_STREET_DECAY
+    return max(cap, CAP_FLOOR)
+
+
+def _range_weights(strength: np.ndarray, keep: float, cap: float = 1.0) -> np.ndarray:
     cut = 1.1 * (1.0 - keep) - 0.1
     x = np.clip((strength - cut) / RANGE_SOFTNESS, -30.0, 30.0)
-    return BLUFF_MIX + (1.0 - BLUFF_MIX) / (1.0 + np.exp(-x))
+    weights = 1.0 / (1.0 + np.exp(-x))
+    if cap < 1.0 and CAP_TRUST > 0.0:
+        top = float(np.quantile(strength, cap))
+        y = np.clip((strength - top) / RANGE_SOFTNESS, -30.0, 30.0)
+        weights = weights * (1.0 - CAP_TRUST / (1.0 + np.exp(-y)))
+    return BLUFF_MIX + (1.0 - BLUFF_MIX) * weights
 
 
 # ----- Decisions -------------------------------------------------------------
@@ -328,7 +353,8 @@ def _analysis(obs: Observation, memory: dict) -> tuple[np.ndarray, np.ndarray]:
 
 def _best_action(obs: Observation, memory: dict) -> Action:
     equity, strength = _analysis(obs, memory)
-    weights = _range_weights(strength, _range_keep(memory["hand"], obs.street))
+    hand = memory["hand"]
+    weights = _range_weights(strength, _range_keep(hand, obs.street), _range_cap(hand, obs.street))
 
     # tail_*[i] sums over hand i and everything stronger: raises need the
     # equity against just the part of the range that continues.
